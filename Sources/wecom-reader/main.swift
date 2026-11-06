@@ -119,7 +119,9 @@ func keepAwake<T>(_ body: () -> T) -> T {
     return body()
 }
 
-enum Outcome { case done(Int), interrupted, skipped, notFound, held }
+enum Outcome { case done(Int), interrupted, skipped, notFound, held, empty, failed, unreadable }
+/// Where the last conversation's time went, for the log.
+var lastTimings = ""
 enum Mode { case recent, deep(until: Date) }
 
 /// Senders that prove a row is a group. Built once from the archive and topped up after every read.
@@ -132,10 +134,31 @@ func now() -> String { isoFormat.string(from: Date()) }
 /// older history in stretches, saving each one, so being interrupted only costs the stretch in progress.
 func processConversation(_ d: Driver, _ c: ConvRow, mode: Mode, state: inout [String: ConvState],
                          opened: () -> Void, stop: () -> Bool) -> Outcome {
+    // A line this version cannot read would be lost when the file is written back, so the file is left alone.
+    guard var archived = archive.loadIntact(c.name) else { return .unreadable }
     var st = state[c.name] ?? ConvState()
-    switch d.select(c, stop: stop) {
+    // An empty conversation was marked whole; once something arrives, its history has to be read like any other.
+    if st.count == 0 { st.complete = false }
+    var clock = Date(), laps: [String] = []
+    func lap(_ name: String) { laps.append("\(name) \(String(format: "%.1f", Date().timeIntervalSince(clock)))"); clock = Date() }
+    defer { lastTimings = laps.joined(separator: ", ") }
+    let picked = d.select(c, stop: stop)
+    lap("open")
+    switch picked {
     case .ok: opened()
-    case .interrupted: return .interrupted
+    case .empty:
+        opened()
+        st.complete = true
+        st.signature = c.preview
+        st.attempts = 0
+        st.retryAfter = nil
+        st.lastRead = now()
+        state[c.name] = st
+        return .empty
+    case .interrupted:
+        // Interrupted right after the click: it is open all the same and has to be handed back.
+        if d.selectedConversation() == c.name { opened() }
+        return .interrupted
     case .noRow: return .notFound
     case .noPane: opened(); return .skipped
     case .held: return .held
@@ -144,12 +167,9 @@ func processConversation(_ d: Driver, _ c: ConvRow, mode: Mode, state: inout [St
     func parse(_ rows: [[AXItem]]) -> [Message] {
         RowParser.assemble(rows, selfName: selfName, peerName: c.name, midX: mid, now: Date())
     }
-    var archived = archive.load(c.name)
     var added = 0
     func save(_ r: MergeResult) -> Bool {
         do { try archive.save(c.name, Merger.fillTimes(r.merged)) } catch { log("save failed \(c.name): \(error)"); return false }
-        archive.setAside(c.name, r.dropped)
-        if !r.dropped.isEmpty { log("set aside \(r.dropped.count) messages of \(c.name) that a full read could not place") }
         archived = r.merged
         added += r.added
         st.count = r.merged.filter { $0.kind != .gap }.count
@@ -163,11 +183,16 @@ func processConversation(_ d: Driver, _ c: ConvRow, mode: Mode, state: inout [St
     // The newest part. Wider each time it does not reach what is already in the archive.
     var covered = 0
     var lined = false
-    for screens in [4, 12, 40] {
+    // Most changes are a few new messages, so a conversation already saved starts with what is on screen,
+    // without loading anything older (loading is most of the time a read takes).
+    for screens in archived.isEmpty ? [4, 12, 40] : [1, 4, 12, 40] {
         if stop() { return .interrupted }
         let want = d.rows(screens: screens)
-        if d.loadedRows < want { d.loadOlder(maxSteps: 80, untilRows: want, stop: stop) }
-        guard let rows = d.readTail(screens: screens, stop: stop) else { return .interrupted }
+        // Only a recent read: a short history ends sooner, and a missed top is found by the history read later.
+        if screens > 1 && d.loadedRows < want { d.loadOlder(maxSteps: 80, untilRows: want, patience: 3, stop: stop) }
+        lap("load\(screens)")
+        guard let rows = d.readTail(screens: screens, stop: stop) else { return stop() ? .interrupted : .failed }
+        lap("read\(screens)")
         let r = Merger.combine(existing: archived, fresh: parse(rows))
         covered = rows.count
         if archived.isEmpty || r.gaps <= gaps(archived) || screens == 40 {
@@ -187,6 +212,7 @@ func processConversation(_ d: Driver, _ c: ConvRow, mode: Mode, state: inout [St
             let r = Merger.combine(existing: archived, fresh: parse(rows), complete: true)
             if save(r) { st.complete = r.gaps == 0; if st.complete { st.reach = 0 } }
         }
+        lap("whole")
     }
     st.signature = c.preview
     state[c.name] = st
@@ -198,18 +224,23 @@ func processConversation(_ d: Driver, _ c: ConvRow, mode: Mode, state: inout [St
     var reached = max(covered, st.reach - 60)
     let stretch = 300
     while Date() < until {
-        let top = d.loadOlder(maxSteps: 2000, untilRows: reached + stretch, stop: stop)
+        // Taking a slow load for the top would mark the history read when it is not, so this waits longer.
+        let top = d.loadOlder(maxSteps: 2000, untilRows: reached + stretch, patience: 15, stop: stop)
+        lap("loadold")
         if stop() { break }
         let loaded = d.loadedRows
         let near = max(1, reached - 60)
         guard loaded > near else { break }
         guard let rows = d.readRange(nearest: near, farthest: loaded, stop: stop) else { break }
+        lap("readold")
         let before = gaps(archived)
         let r = Merger.combine(existing: archived, fresh: parse(rows), position: .oldest, complete: top)
         if !archived.isEmpty && r.gaps > before {
             // The stretch does not join what was read before; start again from the newest next time.
-            log("stretch of \(c.name) did not line up at \(near)–\(loaded), will start over")
+            log("stretch of \(c.name) did not line up at \(near)–\(loaded), will start over tomorrow")
             st.reach = 0
+            // Starting over at once would reach the same place and fail again, a quarter of an hour each pass.
+            st.retryAfter = isoFormat.string(from: Date().addingTimeInterval(86400))
             break
         }
         guard save(r) else { break }
@@ -308,27 +339,47 @@ func runPass(stop: @escaping () -> Bool) -> Bool {
             // Left for the owner to read first. It comes back on its own once the red count is gone.
             if !d.mayOpen(c.facts) { held += 1; continue }
             let began = Date()
-            switch processConversation(d, c, mode: mode, state: &state, opened: { moved = c.name }, stop: stop) {
-            case .done(let n):
-                read += 1; added += n; misses = 0
-                done.insert(c.name)
-                log("read \(c.name): +\(n), \(Int(Date().timeIntervalSince(began)))s")
-                Indexer.kick()
-            case .interrupted: log("interrupted at \(c.name)")
-            case .held: held += 1
-            case .notFound:
-                missing += 1
-                misses += 1
-                log("not reachable now: \(c.name)")
-            case .skipped:
-                // Often the page was wrong rather than the entry, so one miss proves nothing.
-                skipped += 1
-                misses += 1
+            // Three failures in a row put a conversation aside for a day, so one bad entry cannot hold up the rest.
+            func failedOnce() {
                 var st = state[c.name] ?? ConvState()
                 st.attempts += 1
                 if st.attempts >= 3 { st.retryAfter = isoFormat.string(from: Date().addingTimeInterval(86400)) }
                 state[c.name] = st
-                log("no message pane for \(c.name)")
+            }
+            switch processConversation(d, c, mode: mode, state: &state, opened: { moved = c.name }, stop: stop) {
+            case .done(let n):
+                read += 1; added += n; misses = 0
+                done.insert(c.name)
+                log("read \(c.name): +\(n), \(Int(Date().timeIntervalSince(began)))s (\(lastTimings))")
+                Indexer.kick()
+            case .interrupted: log("interrupted at \(c.name)")
+            case .held: held += 1
+            case .empty:
+                // Nothing in it yet; a first message changes the preview and brings it back.
+                misses = 0
+                done.insert(c.name)
+                log("empty: \(c.name)")
+            case .notFound:
+                missing += 1
+                misses += 1
+                failedOnce()
+                log("not reachable now: \(c.name)")
+            case .failed:
+                // The read itself went wrong (a row would not come into view, or messages kept arriving).
+                skipped += 1
+                failedOnce()
+                log("read failed, will retry: \(c.name)")
+            case .unreadable:
+                var st = state[c.name] ?? ConvState()
+                st.retryAfter = isoFormat.string(from: Date().addingTimeInterval(86400 * 7))
+                state[c.name] = st
+                log("archive of \(c.name) has lines this version cannot read; left alone")
+            case .skipped:
+                // Often the page was wrong rather than the entry, so one miss proves nothing.
+                skipped += 1
+                misses += 1
+                failedOnce()
+                log("no message pane for \(c.name): \(d.lastMiss)")
                 if d.conversationRows < convs.count / 2 {
                     log("conversation list replaced, stopping pass")
                     try? archive.saveState(state)
@@ -345,12 +396,13 @@ func runPass(stop: @escaping () -> Bool) -> Bool {
         if let moved, d.selectedConversation() == moved {
             d.scrollToNewest()
             if let p = previous, p.name != moved { d.selectQuickly(p) }
-            else if previous == nil, UnreadRule.sender(of: convs.first { $0.name == moved }?.preview ?? "") == nil,
+            // Not handed back (nothing was open, or the one that was has unread messages now): a private chat left
+            // open would mark its next message read, so a group is opened instead.
+            if d.selectedConversation() == moved, UnreadRule.sender(of: convs.first { $0.name == moved }?.preview ?? "") == nil,
                     let park = convs.first(where: { c in
                         guard let who = UnreadRule.sender(of: c.preview) else { return false }
                         return groupMembers.contains(who) && d.mayOpen(c.facts)
                     }) {
-                // Nothing was open before. Leaving a private chat open would mark its next message read.
                 d.selectQuickly(park)
             }
         }

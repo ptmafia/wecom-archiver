@@ -134,7 +134,8 @@ public enum RowParser {
                 switch i.r {
                 case "AXStaticText":
                     if v.isEmpty { continue }
-                    if let t = TimeParser.parse(v, now: now) { lastTime = t }
+                    // Messages never go back in time, so an earlier "time" is something else, like a video's length.
+                    if let t = TimeParser.parse(v, now: now) { if lastTime.map({ t >= $0 }) ?? true { lastTime = t } }
                     else if v.hasSuffix(":") || v.hasSuffix("：") { quoteName = String(v.dropLast()) }
                     else if pendingFile {
                         if let n = fileName { files.append(Attachment(name: n, size: v)); fileName = nil; pendingFile = false }
@@ -188,8 +189,6 @@ public struct MergeResult: Equatable {
     public var added: Int
     /// The archive still has stretches that were never read.
     public var gaps: Int
-    /// Archive messages a complete read could not place; the caller backs them up before they go.
-    public var dropped: [Message]
 }
 
 /// Combines what was just read with the archive.
@@ -215,7 +214,8 @@ public enum Merger {
         for i in Array(fb.indices.prefix(40)) + Array(fb.indices.suffix(40)) {
             for j in (at[fb[i]] ?? []).suffix(400) { candidates.insert(j - i) }
         }
-        var best: Alignment?, tie = false
+        var best: Alignment?, tied: [Alignment] = []
+        let b0 = b
         for o in candidates {
             let lo = max(0, -o), hi = min(fb.count, fa.count - o)
             let length = hi - lo
@@ -229,13 +229,21 @@ public enum Merger {
             // A run of identical pictures lines up anywhere, so the overlap must hold at least two different messages
             // unless it is the whole of the shorter read.
             let distinct = kinds.count >= 2 || length == shorter
-            guard enough && distinct else { continue }
+            // Differences are only allowed inside the overlap. At its ends they mean one read is shifted against
+            // the other (a row missing), and lining up anyway would overwrite a message.
+            let endsHold = length < 10 || [lo, lo + 1, hi - 2, hi - 1].allSatisfy { fb[$0] == fa[$0 + o] }
+            guard enough && distinct && endsHold else { continue }
             let c = Alignment(offset: o, length: length, matches: matches)
             if let b = best {
-                if c.matches > b.matches { best = c; tie = false } else if c.matches == b.matches { tie = true }
+                if c.matches > b.matches { best = c; tied = [] } else if c.matches == b.matches { tied.append(c) }
             } else { best = c }
         }
-        return tie ? nil : best
+        // Several equally good places: fine when they all give the same result (a read already in the archive twice).
+        if let b = best, !tied.isEmpty {
+            let result = union(a, b0, b)
+            return tied.allSatisfy { union(a, b0, $0) == result } ? b : nil
+        }
+        return best
     }
 
     /// The union of two lined-up reads. Where they differ, the fuller version wins.
@@ -246,7 +254,8 @@ public enum Merger {
             let i = k - al.offset
             let y = i >= 0 && i < b.count ? b[i] : nil
             switch (x, y) {
-            case let (x?, y?): return y.text.isEmpty && !x.text.isEmpty ? x : y
+            // Where they differ, what was saved stays, unless it came out empty and the new read has it.
+            case let (x?, y?): return x.fingerprint == y.fingerprint || (x.text.isEmpty && !y.text.isEmpty) ? y : x
             case let (x?, nil): return x
             case let (nil, y?): return y
             default: fatalError("unreachable")
@@ -265,7 +274,6 @@ public enum Merger {
     public static func combine(existing: [Message], fresh: [Message], position: Position = .newest, complete: Bool = false) -> MergeResult {
         let real = existing.filter { $0.kind != .gap }.count
         var segs = segments(existing)
-        var dropped: [Message] = []
         if !fresh.isEmpty {
             let order = position == .newest ? Array(segs.indices.reversed()) : Array(segs.indices)
             if let i = order.first(where: { align(segs[$0], fresh) != nil }) {
@@ -278,14 +286,16 @@ public enum Merger {
                 }
             } else if position == .newest { segs.append(fresh) } else { segs.insert(fresh, at: 0) }
         }
-        if complete, let whole = segs.first(where: { s in s.count >= fresh.count && align(s, fresh).map { $0.length == fresh.count } ?? false }) {
-            dropped = segs.filter { $0 != whole }.flatMap { $0 }
-            segs = [whole]
+        // A complete read is the whole conversation as WeCom shows it now, so it goes last. Stretches it cannot place
+        // (history cleared on this Mac, or an old misplaced read) stay in front of it: nothing is dropped.
+        if complete, let w = segs.firstIndex(where: { s in s.count >= fresh.count && align(s, fresh).map { $0.length == fresh.count } ?? false }) {
+            let whole = segs.remove(at: w)
+            segs.append(whole)
         }
         var merged: [Message] = []
         for (i, s) in segs.enumerated() { if i > 0 { merged.append(gap) }; merged += s }
         let now = merged.filter { $0.kind != .gap }.count
-        return MergeResult(merged: merged, added: max(0, now - real), gaps: max(0, segs.count - 1), dropped: dropped)
+        return MergeResult(merged: merged, added: max(0, now - real), gaps: max(0, segs.count - 1))
     }
 }
 
@@ -375,6 +385,17 @@ public struct Archive {
         let d = JSONDecoder()
         return s.split(separator: "\n").compactMap { try? d.decode(Message.self, from: Data($0.utf8)) }
     }
+    /// Nil when a line cannot be read, so the file is not rewritten without it. Empty when there is no file.
+    public func loadIntact(_ conv: String) -> [Message]? {
+        guard let s = try? String(contentsOf: dir.appendingPathComponent(Self.fileName(conv)), encoding: .utf8) else { return [] }
+        let d = JSONDecoder()
+        var out: [Message] = []
+        for line in s.split(separator: "\n") where !line.trimmingCharacters(in: .whitespaces).isEmpty {
+            guard let m = try? d.decode(Message.self, from: Data(line.utf8)) else { return nil }
+            out.append(m)
+        }
+        return out
+    }
     public func save(_ conv: String, _ messages: [Message]) throws {
         let e = JSONEncoder(); e.outputFormatting = [.withoutEscapingSlashes, .sortedKeys]
         let body = try messages.map { String(decoding: try e.encode($0), as: UTF8.self) }.joined(separator: "\n") + "\n"
@@ -402,17 +423,6 @@ public struct Archive {
         }
         let old = ((try? fm.contentsOfDirectory(atPath: base.path)) ?? []).sorted().dropLast(7)
         for d in old { try? fm.removeItem(at: base.appendingPathComponent(d)) }
-    }
-    /// Messages a complete read could not place, kept next to the archive rather than thrown away.
-    public func setAside(_ conv: String, _ messages: [Message]) {
-        guard !messages.isEmpty else { return }
-        let dir = root.appendingPathComponent("set-aside")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let e = JSONEncoder(); e.outputFormatting = [.withoutEscapingSlashes, .sortedKeys]
-        let body = messages.compactMap { try? e.encode($0) }.map { String(decoding: $0, as: UTF8.self) }.joined(separator: "\n") + "\n"
-        let url = dir.appendingPathComponent(Self.fileName(conv))
-        if let h = try? FileHandle(forWritingTo: url) { h.seekToEndOfFile(); h.write(Data(body.utf8)); try? h.close() }
-        else { FileManager.default.createFile(atPath: url.path, contents: Data(body.utf8), attributes: [.posixPermissions: 0o600]) }
     }
     public func saveState(_ s: [String: ConvState]) throws {
         try JSONEncoder().encode(s).write(to: statePath, options: .atomic)

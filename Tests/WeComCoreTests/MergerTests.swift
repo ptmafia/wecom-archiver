@@ -55,7 +55,21 @@ private func texts(_ r: MergeResult) -> [String] { r.merged.map { $0.kind == .ga
         var fresh = (11...25).map { m("t\($0)") }
         fresh[5] = Message(at: nil, sender: "系统消息", kind: .system, text: "撤回")
         let r = Merger.combine(existing: old, fresh: fresh)
-        #expect(r.gaps == 0 && r.merged.count == 25 && r.merged[15].text == "撤回")
+        // What was already saved stays; the archive never loses a message to a later read.
+        #expect(r.gaps == 0 && r.merged.count == 25 && r.merged[15].text == "t16")
+    }
+    @Test func anEmptyArchiveRowIsFilledByTheFreshRead() {
+        var old = (1...12).map { m("t\($0)") }
+        old[5] = Message(at: nil, sender: "佐藤", kind: .text, text: "")
+        let r = Merger.combine(existing: old, fresh: (1...14).map { m("t\($0)") })
+        #expect(r.gaps == 0 && r.merged[5].text == "t6" && r.merged.count == 14)
+    }
+    @Test func aShiftNearTheEndIsNotTakenForAMatch() {
+        // One message missing near the newest end shifts the rest by one; lining up anyway would lose a message.
+        let old = (1...30).map { m("t\($0)") }
+        let fresh = (1...30).filter { $0 != 28 }.map { m("t\($0)") } + [m("t31")]
+        let r = Merger.combine(existing: old, fresh: fresh)
+        #expect(texts(r).contains("t28") && texts(r).contains("t31"))
     }
     @Test func aShorterReadNeverShrinksTheArchive() {
         let r = Merger.combine(existing: [m("a"), m("b"), m("c"), m("d"), m("e")], fresh: [m("c"), m("d"), m("e"), m("f")])
@@ -71,23 +85,35 @@ private func texts(_ r: MergeResult) -> [String] { r.merged.map { $0.kind == .ga
         let r = Merger.combine(existing: [m("ok", "佐藤"), m("x")], fresh: [m("ok", "田中"), m("y")])
         #expect(r.gaps == 1)
     }
-    @Test func aCompleteReadReplacesStretchesItCannotPlace() {
+    @Test func aCompleteReadKeepsStretchesItCannotPlace() {
+        // A chat cleared on this Mac shows only the new messages; the saved history must stay, in front.
+        let saved = [m("q"), m("r"), m("s"), m("t")]
+        let r = Merger.combine(existing: saved, fresh: [m("a"), m("b"), m("c")], complete: true)
+        #expect(texts(r) == ["q", "r", "s", "t", "|", "a", "b", "c"])
+    }
+    @Test func aCompleteReadPutsTheWholeConversationLast() {
         let broken = Merger.combine(existing: [m("a"), m("b"), m("c")], fresh: [m("q"), m("r"), m("s")]).merged
         let r = Merger.combine(existing: broken, fresh: [m("a"), m("b"), m("c"), m("d")], complete: true)
-        #expect(texts(r) == ["a", "b", "c", "d"] && r.dropped.map(\.text) == ["q", "r", "s"])
+        #expect(texts(r) == ["q", "r", "s", "|", "a", "b", "c", "d"])
     }
     @Test func aCompleteReadKeepsEverythingItLinesUpWith() {
         let r = Merger.combine(existing: [m("a"), m("b"), m("c")], fresh: [m("a"), m("b"), m("c"), m("d")], complete: true)
-        #expect(texts(r) == ["a", "b", "c", "d"] && r.dropped.isEmpty)
+        #expect(texts(r) == ["a", "b", "c", "d"] && r.gaps == 0)
     }
     @Test func twoMessagesInCommonAreNotEnough() {
         let r = Merger.combine(existing: [m("x"), m("好的"), m("收到")], fresh: [m("好的"), m("收到"), m("新")])
         #expect(r.gaps == 1 && r.added == 3)
     }
-    @Test func ambiguousPlacementIsNotGuessed() {
-        // The fresh run fits twice in the archive; neither place is taken.
+    @Test func aReadAlreadyInTheArchiveTwiceAddsNothing() {
+        // A bot repeating itself: the read fits in two places, and either way nothing is new.
         let r = Merger.combine(existing: [m("a"), m("b"), m("c"), m("a"), m("b"), m("c")], fresh: [m("a"), m("b"), m("c")])
-        #expect(r.added == 3 && r.gaps == 1)
+        #expect(r.added == 0 && r.gaps == 0)
+    }
+    @Test func aShiftAtTheVeryEndIsNotTakenForAMatch() {
+        let old = (1...30).map { m("t\($0)") }
+        let fresh = (1...30).filter { $0 != 29 }.map { m("t\($0)") } + [m("t31")]
+        let t = texts(Merger.combine(existing: old, fresh: fresh))
+        #expect(t.contains("t29") && t.contains("t31"))
     }
 }
 
@@ -108,6 +134,18 @@ private func texts(_ r: MergeResult) -> [String] { r.merged.map { $0.kind == .ga
         let old = #"{"signature":"s","complete":true,"attempts":2,"count":9,"lastRead":"x","depth":3}"#
         let st = try JSONDecoder().decode(ConvState.self, from: Data(old.utf8))
         #expect(st.reach == 0 && st.count == 9 && st.complete && st.retryAfter == nil)
+    }
+    @Test func anArchiveWithALineItCannotReadIsNotOffered() throws {
+        // Saving what could be read would delete the rest, e.g. lines written by a newer version.
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let a = Archive(root: root)
+        try a.prepare()
+        try a.save("群", [Message(at: nil, sender: "佐藤", kind: .text, text: "a")])
+        #expect(a.loadIntact("群")?.count == 1)
+        #expect(a.loadIntact("没有") == [])
+        let url = a.dir.appendingPathComponent(Archive.fileName("群"))
+        try (String(contentsOf: url, encoding: .utf8) + #"{"kind":"poll","sender":"x","text":"?"}"# + "\n").write(to: url, atomically: true, encoding: .utf8)
+        #expect(a.loadIntact("群") == nil)
     }
     @Test func anUnreadableStateFileIsNotTreatedAsEmpty() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

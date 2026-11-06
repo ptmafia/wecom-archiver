@@ -6,6 +6,12 @@ root="$HOME/Library/Application Support/wecom-reader"
 label=local.wecom-reader
 agent="$HOME/Library/LaunchAgents/$label.plist"
 
+major="$(sw_vers -productVersion | cut -d. -f1)"
+if [ "${major:-0}" -lt 14 ]; then
+  echo "需要 macOS 14 或更新的版本，这台是 $(sw_vers -productVersion)。请先升级系统。"
+  exit 1
+fi
+
 if [ -z "$(mdfind "kMDItemCFBundleIdentifier == 'com.tencent.WeWorkMac'" 2>/dev/null | head -1)" ] && [ ! -d /Applications/企业微信.app ]; then
   echo "没有找到企业微信（Mac 版），请先安装。"
   exit 1
@@ -57,7 +63,12 @@ if [ -n "${WECOM_READER_DRY_RUN:-}" ]; then
 fi
 
 launchctl enable "gui/$(id -u)/$label"
-launchctl bootstrap "gui/$(id -u)" "$agent"
+# Right after a reinstall the old one may still be shutting down; launchctl then refuses for a moment.
+for try in 1 2 3 4 5; do
+  launchctl bootstrap "gui/$(id -u)" "$agent" 2>/dev/null && break
+  if [ "$try" = 5 ]; then echo "启动失败，请重启电脑后再双击一次「安装.command」。"; exit 1; fi
+  sleep 2
+done
 open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
 
 echo

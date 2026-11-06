@@ -12,7 +12,7 @@ struct ConvRow {
     var facts: RowFacts { RowFacts(name: name, preview: preview, badge: badge, muted: muted) }
 }
 
-enum SelectResult { case ok, noRow, noPane, interrupted, held }
+enum SelectResult { case ok, noRow, noPane, empty, interrupted, held }
 
 /// Everything that talks to WeCom through the Accessibility API.
 final class Driver {
@@ -130,6 +130,24 @@ final class Driver {
     var onMessagesTab: Bool { layout().conv != nil }
 
     var conversationRows: Int { layout().conv.map { rows($0).count } ?? 0 }
+    /// Why the last conversation showed no message pane, for the log. Roles and sizes only, never text.
+    var lastMiss = ""
+    private func rightSide() -> String {
+        let l = layout()
+        guard let w = chatWindow, let c = l.convArea else { return "-" }
+        let edge = frame(c).maxX
+        var out: [String] = []
+        func walk(_ e: AXUIElement, _ depth: Int) {
+            if depth > 4 || out.count > 40 { return }
+            for k in kids(e) {
+                let f = frame(k)
+                if f.minX >= edge - 2 && f.width > 30 && f.height > 30 { out.append("\(depth)\(role(k)):\(Int(f.width))x\(Int(f.height))") }
+                walk(k, depth + 1)
+            }
+        }
+        walk(w, 0)
+        return out.joined(separator: " ")
+    }
     /// Pane sizes only, for the log.
     func describe() -> String {
         let windows = allWindows()
@@ -169,8 +187,9 @@ final class Driver {
             if stop() { return }
             guard let b = listBar(), let c = layout().conv else { return }
             setScroll(b, 1)
-            pause(0.5, stop)
-            let n = rows(c).count
+            // A page of rows can take a few seconds to arrive; wait for it rather than a fixed time.
+            var n = rows(c).count
+            for _ in 0..<30 where n == last { pause(0.1, stop); n = rows(c).count }
             same = n == last ? same + 1 : 0
             last = n
         }
@@ -225,6 +244,9 @@ final class Driver {
             if stop() { return .interrupted }
             if selectedConversation() == r.name, let m = layout().msg, !rows(m).isEmpty { pause(0.4, stop); return .ok }
         }
+        // Opened and the pane is there, but it has no messages (never written to, or cleared on this Mac).
+        if selectedConversation() == r.name && loadedRows == 0 { return .empty }
+        lastMiss = "selected \(selectedConversation() == r.name), preview \(r.preview.count) chars, msg rows \(loadedRows), right side \(rightSide())"
         return .noPane
     }
     /// The message pane's horizontal centre, used to tell own messages from others'.
@@ -251,7 +273,7 @@ final class Driver {
 
     /// Loads older messages until `rows` are loaded, the top is reached, or `maxSteps` loads. True at the top.
     @discardableResult
-    func loadOlder(maxSteps: Int, untilRows target: Int = .max, stop: () -> Bool) -> Bool {
+    func loadOlder(maxSteps: Int, untilRows target: Int = .max, patience: Int = 8, stop: () -> Bool) -> Bool {
         var same = 0
         for _ in 0..<maxSteps {
             if stop() { return false }
@@ -268,7 +290,7 @@ final class Driver {
             var grew = false
             for _ in 0..<15 { pause(0.1, stop); if stop() { return false }; if rows(m).count > before { grew = true; break } }
             same = grew ? 0 : same + 1
-            if same >= 8 { return true }
+            if same >= patience { return true }
         }
         return false
     }

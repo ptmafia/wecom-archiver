@@ -24,6 +24,16 @@ private let now = makeDate("2026-11-04 12:00")
         ], selfName: "我", now: now)
         #expect(m[1].at == "2026-11-04 09:34")
     }
+    @Test func aVideoLengthIsNotATime() {
+        // A video shows its length (00:06) like a time; messages never go back in time, so it is not one.
+        let video = AXItem(r: "AXImage", v: "", x: 640, w: 200)
+        let m = RowParser.assemble([
+            [avatar(), b("佐藤"), s("10:05"), t("一")],
+            [avatar(), b("佐藤"), video, s("00:06")],
+            [avatar(), b("佐藤"), t("二")],
+        ], selfName: "我", now: now)
+        #expect(m.map(\.at) == ["2026-11-04 10:05", "2026-11-04 10:05", "2026-11-04 10:05"])
+    }
     @Test func quoteIsSeparatedFromMainText() {
         let m = RowParser.assemble([[avatar(), b("佐藤"), s("鈴木:"), t("元の発言"), t("返信"), b("ボタン")]], selfName: "我", now: now)
         #expect(m[0].text == "返信")
