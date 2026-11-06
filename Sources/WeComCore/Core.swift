@@ -320,10 +320,12 @@ public struct ConvState: Codable, Equatable {
     public var reach: Int
     /// A conversation that would not open is left until then ("yyyy-MM-dd HH:mm:ss").
     public var retryAfter: String?
+    /// `Priority.score` as of the last read; nil until read once.
+    public var value: Double?
     public init(signature: String = "", complete: Bool = false, attempts: Int = 0, count: Int = 0, lastRead: String = "",
-                depth: Int = 0, reach: Int = 0, retryAfter: String? = nil) {
+                depth: Int = 0, reach: Int = 0, retryAfter: String? = nil, value: Double? = nil) {
         self.signature = signature; self.complete = complete; self.attempts = attempts; self.count = count
-        self.lastRead = lastRead; self.depth = depth; self.reach = reach; self.retryAfter = retryAfter
+        self.lastRead = lastRead; self.depth = depth; self.reach = reach; self.retryAfter = retryAfter; self.value = value
     }
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -331,7 +333,62 @@ public struct ConvState: Codable, Equatable {
                   attempts: try c.decode(Int.self, forKey: .attempts), count: try c.decode(Int.self, forKey: .count),
                   lastRead: try c.decode(String.self, forKey: .lastRead), depth: try c.decodeIfPresent(Int.self, forKey: .depth) ?? 0,
                   reach: try c.decodeIfPresent(Int.self, forKey: .reach) ?? 0,
-                  retryAfter: try c.decodeIfPresent(String.self, forKey: .retryAfter))
+                  retryAfter: try c.decodeIfPresent(String.self, forKey: .retryAfter),
+                  value: try c.decodeIfPresent(Double.self, forKey: .value))
+    }
+}
+
+/// How much a conversation is worth reading in full, from what is already saved. Only things every install has are
+/// used: how much the owner takes part, mentions, how small the circle is, files, how recent; plus optional words
+/// the owner cares about (`priority-words.txt`). Notifications and big groups the owner never speaks in score low.
+public enum Priority {
+    public enum Tier: String { case high, mid, low }
+    public static func tier(_ score: Double) -> Tier { score >= 4 ? .high : score >= 1.5 ? .mid : .low }
+
+    public static func score(_ messages: [Message], selfName: String, words: [String] = [], name: String = "", now: Date) -> Double {
+        let real = messages.filter { $0.kind != .gap }
+        let human = real.filter { $0.kind != .system }
+        guard !human.isEmpty else { return 0 }
+        let own = human.filter { $0.sender == selfName }.count
+        let people = Set(human.map(\.sender)).subtracting([selfName, "系统消息", "未知", ""]).count
+        let mentions = selfName == "我" ? 0 : human.filter { $0.text.contains("@\(selfName)") }.count
+        let files = real.filter { $0.kind == .file }.count
+        let hits = words.isEmpty ? 0 : human.filter { m in words.contains { m.text.contains($0) } }.count
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm"
+        let last = real.compactMap { $0.at.flatMap(f.date(from:)) }.max()
+        let recent = last.map { now.timeIntervalSince($0) < 14 * 86400 } ?? false
+
+        var s = 4 * min(Double(own) / Double(human.count) / 0.3, 1)
+        s += 2 * min(Double(mentions) / 5, 1)
+        s += people <= 1 ? 1.5 : people <= 10 ? 1 : 0.3
+        s += min(Double(files) / 5, 1)
+        s += recent ? 1 : 0
+        s += 1.5 * min(Double(hits) / 10, 1)
+        // Named after a store, project or client the owner cares about: worth it even if the owner only reads.
+        let named = words.contains { name.contains($0) }
+        if named { s += 1.5 }
+        // Never answered, never mentioned: a notification feed, or a crowd the owner only listens to.
+        else if own == 0 && mentions == 0 { s *= people <= 1 ? 0.3 : 0.5 }
+        return s
+    }
+
+    /// A guess for a conversation not read yet, from its list row: a private chat, or a group where the owner or a
+    /// known colleague spoke last, comes first.
+    public static func estimate(name: String, sender: String?, selfName: String, known: Set<String>, words: [String] = []) -> Double {
+        var s: Double
+        if let who = sender { s = who == selfName ? 3 : known.contains(who) ? 2 : 1.5 } else { s = 3 }
+        if words.contains(where: { name.contains($0) }) { s += 1.5 }
+        return s
+    }
+}
+
+/// Where an install stands. Just installed: most conversations never read, so every one first gets its newest
+/// messages. Then the history of what matters. Then day to day: keeping up.
+public enum Stage: String {
+    case start, history, daily
+    public static func of(total: Int, neverRead: Int, historyLeft: Int) -> Stage {
+        if neverRead > max(10, total / 10) { return .start }
+        return historyLeft > 0 ? .history : .daily
     }
 }
 
@@ -385,6 +442,7 @@ public struct Archive {
         let d = JSONDecoder()
         return s.split(separator: "\n").compactMap { try? d.decode(Message.self, from: Data($0.utf8)) }
     }
+    public func exists(_ conv: String) -> Bool { FileManager.default.fileExists(atPath: dir.appendingPathComponent(Self.fileName(conv)).path) }
     /// Nil when a line cannot be read, so the file is not rewritten without it. Empty when there is no file.
     public func loadIntact(_ conv: String) -> [Message]? {
         guard let s = try? String(contentsOf: dir.appendingPathComponent(Self.fileName(conv)), encoding: .utf8) else { return [] }

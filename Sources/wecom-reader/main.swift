@@ -124,6 +124,31 @@ enum Outcome { case done(Int), interrupted, skipped, notFound, held, empty, fail
 var lastTimings = ""
 enum Mode { case recent, deep(until: Date) }
 
+/// Words that make a conversation worth more (a store, a project, a client), one per line in `priority-words.txt`
+/// next to the archive. Optional; read again every pass.
+var priorityWords: [String] = []
+func loadPriorityWords() {
+    let s = (try? String(contentsOf: archive.root.appendingPathComponent("priority-words.txt"), encoding: .utf8)) ?? ""
+    priorityWords = s.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { $0.count >= 2 }
+}
+
+var scoredThisRun = false
+/// Whether someone is at the computer, from the time since the last key press or mouse move.
+enum Presence {
+    static let awayAfter: TimeInterval = 900
+    static func idleSeconds() -> TimeInterval {
+        var it: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOHIDSystem"), &it) == KERN_SUCCESS else { return 0 }
+        defer { IOObjectRelease(it) }
+        let e = IOIteratorNext(it)
+        guard e != 0 else { return 0 }
+        defer { IOObjectRelease(e) }
+        guard let v = IORegistryEntryCreateCFProperty(e, "HIDIdleTime" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? NSNumber else { return 0 }
+        return v.doubleValue / 1_000_000_000
+    }
+    static var away: Bool { idleSeconds() >= awayAfter }
+}
+
 /// Senders that prove a row is a group. Built once from the archive and topped up after every read.
 var groupMembers = Set<String>()
 func refreshGroupMembers() { groupMembers = GroupMembers.from(archive.loadAll(), selfName: selfName) }
@@ -176,6 +201,7 @@ func processConversation(_ d: Driver, _ c: ConvRow, mode: Mode, state: inout [St
         st.lastRead = now()
         let people = Set(r.merged.map(\.sender)).subtracting([selfName, "系统消息", "未知", ""])
         if people.count >= 2 { groupMembers.formUnion(people) }
+        st.value = Priority.score(r.merged, selfName: selfName, words: priorityWords, name: c.name, now: Date())
         return true
     }
     func gaps(_ ms: [Message]) -> Int { ms.filter { $0.kind == .gap }.count }
@@ -223,7 +249,9 @@ func processConversation(_ d: Driver, _ c: ConvRow, mode: Mode, state: inout [St
     state[c.name] = st
     var reached = max(covered, st.reach - 60)
     let stretch = 300
-    while Date() < until {
+    // While someone is at the computer, history is read a few minutes at a time; they may want WeCom back any moment.
+    let turnStarted = Date()
+    while Date() < until && (Presence.away || Date().timeIntervalSince(turnStarted) < 180) {
         // Taking a slow load for the top would mark the history read when it is not, so this waits longer.
         let top = d.loadOlder(maxSteps: 2000, untilRows: reached + stretch, patience: 15, stop: stop)
         lap("loadold")
@@ -308,17 +336,48 @@ func runPass(stop: @escaping () -> Bool) -> Bool {
         d.mayOpen = { UnreadRule.mayOpen($0, known: groupMembers, selfName: selfName) }
         let nowText = now()
         func waitingRetry(_ n: String) -> Bool { state[n]?.retryAfter.map { $0 > nowText } ?? false }
-        // 1. New messages in conversations already read. 2. A first, recent read of every conversation.
-        // 3. Older history, newest conversations first. The least tried go first in each group.
-        func byTries(_ list: [ConvRow]) -> [ConvRow] {
-            list.enumerated().sorted { (state[$0.element.name]?.attempts ?? 0, $0.offset) < (state[$1.element.name]?.attempts ?? 0, $1.offset) }.map(\.element)
+        // What each conversation is worth: its score once read, a guess from the list row before that.
+        loadPriorityWords()
+        // Read before, but the file is gone (deleted, or moved aside by hand): read it again from the start.
+        for c in convs where (state[c.name]?.count ?? 0) > 0 && !archive.exists(c.name) {
+            log("archive of \(c.name) is missing, reading it again")
+            state[c.name] = nil
         }
-        let changed = byTries(convs.filter { state[$0.name] != nil && state[$0.name]?.signature != $0.preview && !waitingRetry($0.name) })
-        let fresh = convs.filter { state[$0.name] == nil }
-        let deep = convs.filter { state[$0.name].map { !$0.complete } ?? true }.filter { !waitingRetry($0.name) }
-        backlogLeft = !fresh.isEmpty || !deep.isEmpty
+        // Scored again once per run, so a change to the words or the formula reaches every conversation.
+        let rescore = !scoredThisRun
+        scoredThisRun = true
+        for c in convs where state[c.name] != nil && (rescore || state[c.name]?.value == nil) && (state[c.name]?.count ?? 0) > 0 {
+            state[c.name]?.value = Priority.score(archive.load(c.name), selfName: selfName, words: priorityWords, name: c.name, now: Date())
+        }
+        func worth(_ c: ConvRow) -> Double {
+            state[c.name]?.value ?? Priority.estimate(name: c.name, sender: UnreadRule.sender(of: c.preview), selfName: selfName,
+                                                      known: groupMembers, words: priorityWords)
+        }
+        // Most valuable first; on a tie the one tried less, then the one higher in WeCom's list (more recent).
+        func ranked(_ list: [ConvRow]) -> [ConvRow] {
+            list.enumerated().sorted { a, b in
+                let (wa, wb) = (worth(a.element), worth(b.element))
+                if wa != wb { return wa > wb }
+                let (ta, tb) = (state[a.element.name]?.attempts ?? 0, state[b.element.name]?.attempts ?? 0)
+                return ta != tb ? ta < tb : a.offset < b.offset
+            }.map(\.element)
+        }
+        // 1. New messages in conversations already read. 2. The newest messages of every conversation never read.
+        // 3. Older history, but not for conversations worth little (notifications, crowds the owner only listens to).
+        let changed = ranked(convs.filter { state[$0.name] != nil && state[$0.name]?.signature != $0.preview && !waitingRetry($0.name) })
+        let fresh = ranked(convs.filter { state[$0.name] == nil })
+        let historyLeft = convs.filter { c in
+            guard let st = state[c.name] else { return false }
+            return !st.complete && !waitingRetry(c.name)
+        }
+        let worthy = ranked(historyLeft.filter { Priority.tier(worth($0)) != .low })
+        let away = Presence.away
+        // Little worth (notifications, crowds the owner only listens to) comes last, and only when nobody is around.
+        let deep = worthy + (away ? ranked(historyLeft.filter { Priority.tier(worth($0)) == .low }) : [])
+        backlogLeft = !fresh.isEmpty || !historyLeft.isEmpty
+        let stage = Stage.of(total: convs.count, neverRead: fresh.count, historyLeft: worthy.count)
         if !stop() {
-            log("pass start: \(convs.count) conversations, \(changed.count) changed, \(fresh.count) new, \(deep.count) with history left")
+            log("pass start: \(convs.count) conversations, \(changed.count) changed, \(fresh.count) new, \(deep.count) with history left; stage \(stage.rawValue), \(away ? "away" : "at the computer")")
             if !twins.isEmpty { log("same name twice, not read: \(twins.count)") }
             // The names feed the tier list; a conversation's name can be sensitive, so the file is private.
             FileManager.default.createFile(atPath: archive.root.appendingPathComponent("conversations.txt").path,
@@ -328,13 +387,17 @@ func runPass(stop: @escaping () -> Bool) -> Bool {
         let work: [(ConvRow, Mode)] = changed.map { ($0, .recent) } + fresh.map { ($0, .recent) }
             + deep.map { ($0, .deep(until: Date.distantFuture)) }
         var done = Set<String>()
+        let passStarted = Date()
         passLoop: for (c, mode) in work {
             if stop() { break }
+            // New messages are picked up at the start of a pass, so a long pass starts over now and then.
+            if Date().timeIntervalSince(passStarted) > (Presence.away ? 1800 : 600) { log("starting over to pick up new messages"); break }
             var mode = mode
-            // One conversation's history gets 15 minutes a turn, so the rest keep moving.
             if case .deep = mode {
                 if done.contains(c.name) && state[c.name]?.complete == true { continue }
-                mode = .deep(until: Date().addingTimeInterval(900))
+                // Away from the computer the most valuable get long turns; otherwise a few minutes (see processConversation).
+                let turn: TimeInterval = Priority.tier(worth(c)) == .high ? 3600 : 1200
+                mode = .deep(until: Date().addingTimeInterval(turn))
             } else if done.contains(c.name) { continue }
             // Left for the owner to read first. It comes back on its own once the red count is gone.
             if !d.mayOpen(c.facts) { held += 1; continue }
@@ -391,7 +454,9 @@ func runPass(stop: @escaping () -> Bool) -> Bool {
             if misses >= 3 { log("stopping pass: conversations not reachable"); break }
         }
         let finished = !stop()
-        if finished { backlogLeft = convs.contains { c in !waitingRetry(c.name) && !(state[c.name]?.complete ?? false) } }
+        if finished {
+            backlogLeft = convs.contains { c in state[c.name] == nil || (!waitingRetry(c.name) && !(state[c.name]?.complete ?? false)) }
+        }
         // Put WeCom back, unless the user has already clicked something else.
         if let moved, d.selectedConversation() == moved {
             d.scrollToNewest()
@@ -515,7 +580,16 @@ case "status":
     guard let st = archive.loadState() else { print("state.json cannot be read"); exit(1) }
     print("conversations tracked:", st.count, "complete:", st.values.filter(\.complete).count,
           "messages:", st.values.reduce(0) { $0 + $1.count }, "last read:", st.values.map(\.lastRead).max() ?? "-")
+    let tiers = Dictionary(grouping: st.values.compactMap(\.value), by: { Priority.tier($0).rawValue }).mapValues(\.count)
+    print("worth reading in full: high \(tiers["high"] ?? 0), mid \(tiers["mid"] ?? 0), low \(tiers["low"] ?? 0) (low: history only when away, after the rest)")
+    print(Presence.away ? "away from the computer: reading history in long turns" : "someone at the computer: short reads only")
+case "rank":
+    // Conversation names and scores, most valuable first, for checking the order. Names only, no message text.
+    guard let st = archive.loadState() else { print("state.json cannot be read"); exit(1) }
+    for (name, v) in st.compactMap({ k, v in v.value.map { (k, $0) } }).sorted(by: { $0.1 > $1.1 }) {
+        print(String(format: "%.1f", v), Priority.tier(v).rawValue, st[name]?.complete == true ? "whole" : "-", name)
+    }
     print("images read:", OCR.count())
 default:
-    print("usage: wecom-reader daemon | trust | read <conversation> [--full] | status | unread | search <words> | policy | stats | recent <kind> <entity>")
+    print("usage: wecom-reader daemon | trust | read <conversation> [--full] | status | rank | unread | search <words> | policy | stats | recent <kind> <entity>")
 }
