@@ -1,0 +1,6 @@
+.build/
+.swiftpm/
+*.jsonl
+*.log
+.DS_Store
+deploy/private-words.txt
