@@ -8,7 +8,6 @@ let package = Package(
         .target(name: "WeComCore"),
         .executableTarget(name: "wecom-reader", dependencies: ["WeComCore"]),
         .executableTarget(name: "wecom-reader-launcher"),
-        .executableTarget(name: "chat-ocr"),
         .testTarget(name: "WeComCoreTests", dependencies: ["WeComCore"]),
     ],
     swiftLanguageModes: [.v5]
